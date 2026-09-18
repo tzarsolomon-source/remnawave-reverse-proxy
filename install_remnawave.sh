@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="3.3.7"
+SCRIPT_VERSION="3.3.8"
 UPDATE_AVAILABLE=false
 DIR_REMNAWAVE="/usr/local/remnawave_reverse/"
 LANG_FILE="${DIR_REMNAWAVE}selected_language"
@@ -7,7 +7,7 @@ LANG_FILE="${DIR_REMNAWAVE}selected_language"
 # Where this script and its modules/languages are downloaded from.
 # Flip SOURCE_BRANCH to "dev" to point every download at the development
 # branch at once — no other URL in this file mentions the branch.
-SOURCE_REPO="eGamesAPI/remnawave-reverse-proxy"
+SOURCE_REPO="tzarsolomon-source/remnawave-reverse-proxy"
 SOURCE_BRANCH="main"
 SOURCE_BASE_URL="https://raw.githubusercontent.com/${SOURCE_REPO}/refs/heads/${SOURCE_BRANCH}"
 
@@ -18,7 +18,7 @@ LANG_BASE_URL="${SOURCE_BASE_URL}/src/lang"
 # this script. Sourcing files an older release left behind would run code this
 # version was never tested against, so the cache carries a stamp.
 SOURCE_STAMP_FILE="${DIR_REMNAWAVE}source"
-SOURCE_STAMP="$SCRIPT_VERSION"
+SOURCE_STAMP="$SOURCE_REPO:$SOURCE_BRANCH:$SCRIPT_VERSION"
 
 # A src/ directory next to this script wins over the network, so a change can
 # be run before it is pushed. Empty when the script runs from /usr/local/bin.
@@ -1015,7 +1015,7 @@ manage_install() {
                 2)
                     load_caddy_module
                     load_api_module
-                    if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+                    if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
                         install_packages || {
                             echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
                             exit 1
@@ -1097,7 +1097,7 @@ manage_install() {
                     ;;
                 2)
                     load_caddy_node_module
-                    if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+                    if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
                         install_packages || {
                             echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
                             exit 1

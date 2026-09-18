@@ -43,6 +43,11 @@ install_node_caddy() {
     echo -e "${COLOR_YELLOW}${LANG[CERT_CONFIRM]}${COLOR_RESET}"
     read_yn confirm || { echo -e "${COLOR_RED}${LANG[ABORT_MESSAGE]}${COLOR_RESET}"; exit 1; }
 
+    load_certificates_module
+    local -A node_domains_to_check=(["$SELFSTEAL_DOMAIN"]=1)
+    handle_certificates node_domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnanode" false || return 1
+    NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
+
     cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
@@ -70,6 +75,8 @@ services:
           - /var/www/html:/var/www/html:ro
           - /dev/shm:/dev/shm:rw
           - caddy_data:/data
+          - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/fullchain.pem:/ssl/fullchain.pem:ro
+          - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/privkey.pem:/ssl/privkey.pem:ro
       command: sh -c 'rm -f /dev/shm/nginx.sock && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
       environment:
           - CADDY_SOCKET_PATH=/dev/shm/nginx.sock
@@ -95,6 +102,8 @@ services:
       volumes:
         - /dev/shm:/dev/shm:rw
         - /var/log/remnanode:/var/log/remnanode
+        - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/fullchain.pem:/ssl/fullchain.pem:ro
+        - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/privkey.pem:/ssl/privkey.pem:ro
 
 volumes:
   caddy_data:
@@ -121,6 +130,7 @@ http://{\$SELF_STEAL_DOMAIN} {
 }
 
 https://{\$SELF_STEAL_DOMAIN} {
+    tls /ssl/fullchain.pem /ssl/privkey.pem
     bind unix/{\$CADDY_SOCKET_PATH}
     root * /var/www/html
     try_files {path} /index.html
@@ -138,7 +148,7 @@ installation_node_caddy() {
     check_node_not_running
     check_port_443_free
     echo -e "${COLOR_YELLOW}${LANG[INSTALLING_NODE]}${COLOR_RESET}"
-    install_node_caddy
+    install_node_caddy || return 1
 
     ufw allow 80/tcp comment 'HTTP' > /dev/null 2>&1
     ufw allow from $PANEL_IP to any port 2222 > /dev/null 2>&1

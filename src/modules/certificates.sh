@@ -1,6 +1,89 @@
 #!/bin/bash
 # Module: Certificates — certbot issuance, renewal, hooks and cron
 
+# Resolve the actual lineage, including Certbot's -0001 suffixes and wildcard
+# certificates. Never infer a filesystem path from the selected DNS provider.
+resolve_certificate_domain() {
+    local domain="${1#\*.}" candidate name parent="$1"
+    local cert_root="/etc/letsencrypt/live"
+    [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+    parent="$domain"
+
+    while [[ "$parent" == *.* ]]; do
+        while IFS= read -r candidate; do
+            name="${candidate##*/}"
+            if [ "$name" != "$parent" ]; then
+                [[ "${name#"$parent"-}" =~ ^[0-9]+$ ]] || continue
+            fi
+            [ -s "$candidate/fullchain.pem" ] && [ -s "$candidate/privkey.pem" ] || continue
+            local sans
+            sans=$(openssl x509 -in "$candidate/fullchain.pem" -noout -ext subjectAltName 2>/dev/null \
+                | grep -o 'DNS:[^ ,]*' | sed 's/^DNS://')
+            if [ -z "$sans" ]; then
+                sans=$(openssl x509 -in "$candidate/fullchain.pem" -noout -subject -nameopt RFC2253 2>/dev/null \
+                    | sed -n 's/.*CN=\([^,]*\).*/\1/p')
+            fi
+            if cert_covers_domain "$domain" "$sans"; then
+                printf '%s\n' "$name"
+                return 0
+            fi
+        done < <(find "$cert_root" -mindepth 1 -maxdepth 1 -type d \
+            \( -name "$parent" -o -name "$parent-[0-9]*" \) 2>/dev/null | sort -V -r)
+        parent="${parent#*.}"
+    done
+    return 1
+}
+
+choose_bunny_certificate_type() {
+    echo -e "${COLOR_YELLOW}${LANG[BUNNY_CERT_TYPE_PROMPT]}${COLOR_RESET}"
+    echo -e "1. ${LANG[BUNNY_CERT_SINGLE]}"
+    echo -e "2. ${LANG[BUNNY_CERT_WILDCARD]}"
+    local choice
+    while true; do
+        reading "${LANG[BUNNY_CERT_TYPE_CHOOSE]}" choice || return 1
+        case "$choice" in
+            1) BUNNY_CERT_TYPE=single; return 0 ;;
+            2) BUNNY_CERT_TYPE=wildcard; return 0 ;;
+            *) echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}" ;;
+        esac
+    done
+}
+
+ensure_bunny_plugin() {
+    certbot plugins 2>/dev/null | grep -q 'dns-bunny' && return 0
+    echo -e "${COLOR_YELLOW}${LANG[BUNNY_PLUGIN_INSTALLING]}${COLOR_RESET}"
+    local certbot_path
+    certbot_path=$(readlink -f "$(command -v certbot)")
+    if [[ "$(command -v certbot)" == /snap/* || "$certbot_path" == */snap ]]; then
+        snap set certbot trust-plugin-with-root=ok &&
+            snap install certbot-dns-bunny &&
+            snap connect certbot:plugin certbot-dns-bunny || return 1
+    elif python3 -m pip install --help 2>&1 | grep -q 'break-system-packages'; then
+        python3 -m pip install --break-system-packages certbot-dns-bunny || return 1
+    else
+        python3 -m pip install certbot-dns-bunny || return 1
+    fi
+    if ! certbot plugins 2>/dev/null | grep -q 'dns-bunny'; then
+        echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_BUNNY_PLUGIN]}${COLOR_RESET}"
+        return 1
+    fi
+}
+
+write_bunny_credentials() {
+    local credentials_file="$1"
+    if [ -z "$BUNNY_API_KEY" ]; then
+        read -rs -p " $(question "${LANG[ENTER_BUNNY_TOKEN]}")" BUNNY_API_KEY || return 1
+        echo
+    fi
+    [ -n "$BUNNY_API_KEY" ] || return 1
+    # Apply restrictive permissions before writing the API key.
+    ( umask 077
+      mkdir -p "$(dirname "$credentials_file")" &&
+      touch "$credentials_file" && chmod 600 "$credentials_file" &&
+      printf 'dns_bunny_api_key = %s\n' "$BUNNY_API_KEY" > "$credentials_file"
+    )
+}
+
 is_wildcard_cert() {
     local domain=$1
     local cert_path="/etc/letsencrypt/live/$domain/fullchain.pem"
@@ -17,58 +100,12 @@ is_wildcard_cert() {
 }
 
 check_certificates() {
-    local DOMAIN=$1
-    local cert_dir="/etc/letsencrypt/live"
-
-    if [ ! -d "$cert_dir" ]; then
-        echo -e "${COLOR_RED}${LANG[CERT_NOT_FOUND]} $DOMAIN${COLOR_RESET}"
+    local domain="$1" lineage
+    if ! lineage=$(resolve_certificate_domain "$domain"); then
+        echo -e "${COLOR_RED}${LANG[CERT_NOT_FOUND]} $domain${COLOR_RESET}"
         return 1
     fi
-
-    local live_dir=$(find "$cert_dir" -maxdepth 1 -type d -name "${DOMAIN}*" 2>/dev/null | sort -V | tail -n 1)
-    if [ -n "$live_dir" ] && [ -d "$live_dir" ]; then
-        # Manually uploaded pairs (fullchain + privkey only) are not managed
-        # by certbot: no renewal conf, no archive symlinks. Requiring the
-        # full certbot layout here would reject a valid own certificate.
-        if [ ! -f "/etc/letsencrypt/renewal/$(basename "$live_dir").conf" ]; then
-            if [ -s "$live_dir/fullchain.pem" ] && [ -s "$live_dir/privkey.pem" ]; then
-                echo -e "${COLOR_GREEN}${LANG[CERT_FOUND]}$(basename "$live_dir")${COLOR_RESET}"
-                return 0
-            fi
-            echo -e "${COLOR_RED}${LANG[CERT_NOT_FOUND]} $DOMAIN (missing fullchain.pem or privkey.pem)${COLOR_RESET}"
-            return 1
-        fi
-
-        local files=("cert.pem" "chain.pem" "fullchain.pem" "privkey.pem")
-        for file in "${files[@]}"; do
-            local file_path="$live_dir/$file"
-            if [ ! -f "$file_path" ]; then
-                echo -e "${COLOR_RED}${LANG[CERT_NOT_FOUND]} $DOMAIN (missing $file)${COLOR_RESET}"
-                return 1
-            fi
-            if [ ! -L "$file_path" ]; then
-                fix_letsencrypt_structure "$(basename "$live_dir")"
-                if [ $? -ne 0 ]; then
-                    echo -e "${COLOR_RED}${LANG[CERT_NOT_FOUND]} $DOMAIN (failed to fix structure)${COLOR_RESET}"
-                    return 1
-                fi
-            fi
-        done
-        echo -e "${COLOR_GREEN}${LANG[CERT_FOUND]}$(basename "$live_dir")${COLOR_RESET}"
-        return 0
-    fi
-
-    local base_domain=$(extract_domain "$DOMAIN")
-    if [ "$base_domain" != "$DOMAIN" ]; then
-        live_dir=$(find "$cert_dir" -maxdepth 1 -type d -name "${base_domain}*" 2>/dev/null | sort -V | tail -n 1)
-        if [ -n "$live_dir" ] && [ -d "$live_dir" ] && is_wildcard_cert "$base_domain"; then
-            echo -e "${COLOR_GREEN}${LANG[WILDCARD_CERT_FOUND]}$base_domain ${LANG[FOR_DOMAIN]} $DOMAIN${COLOR_RESET}"
-            return 0
-        fi
-    fi
-
-    echo -e "${COLOR_RED}${LANG[CERT_NOT_FOUND]} $DOMAIN${COLOR_RESET}"
-    return 1
+    echo -e "${COLOR_GREEN}${LANG[CERT_FOUND]}$lineage${COLOR_RESET}"
 }
 
 check_api() {
@@ -99,11 +136,16 @@ check_api() {
 }
 
 get_certificates() {
-    local DOMAIN=$1
+    local DOMAIN="${1#\*.}"
     local CERT_METHOD=$2
     local LETSENCRYPT_EMAIL=$3
     local BASE_DOMAIN=$(extract_domain "$DOMAIN")
     local WILDCARD_DOMAIN="*.$BASE_DOMAIN"
+    local bunny_cert_type="${4:-single}"
+    local expected_lineage="$DOMAIN"
+    if [ "$CERT_METHOD" = "1" ] || [ "$CERT_METHOD" = "3" ]; then
+        expected_lineage="$BASE_DOMAIN"
+    fi
 
     printf "${COLOR_YELLOW}${LANG[GENERATING_CERTS]}${COLOR_RESET}\n" "$DOMAIN"
 
@@ -148,17 +190,12 @@ EOL
                 --agree-tos \
                 --non-interactive \
                 --key-type ecdsa \
-                --elliptic-curve secp384r1
+                --elliptic-curve secp384r1 || return 1
             ;;
         2)
             # ACME HTTP-01 (without wildcard)
-            local nginx_was_running=false
-            if docker ps --filter "name=^/remnawave-nginx$" --format '{{.Names}}' | grep -qx "remnawave-nginx"; then
-                nginx_was_running=true
-                docker stop remnawave-nginx > /dev/null
-            fi
-
-            ufw allow 80/tcp comment 'HTTP for ACME challenge' > /dev/null 2>&1
+            install_certbot_hook_script || return 1
+            "${DIR_REMNAWAVE}certbot-hooks.sh" pre || return 1
 
             certbot certonly \
                 --standalone \
@@ -171,12 +208,7 @@ EOL
                 --elliptic-curve secp384r1
             local certbot_status=$?
 
-            ufw delete allow 80/tcp > /dev/null 2>&1
-            ufw reload > /dev/null 2>&1
-
-            if [ "$nginx_was_running" = true ]; then
-                docker start remnawave-nginx > /dev/null
-            fi
+            "${DIR_REMNAWAVE}certbot-hooks.sh" post
 
             if [ "$certbot_status" -ne 0 ]; then
                 return "$certbot_status"
@@ -226,7 +258,52 @@ EOL
                 --agree-tos \
                 --non-interactive \
                 --key-type ecdsa \
-                --elliptic-curve secp384r1
+                --elliptic-curve secp384r1 || return 1
+            ;;
+        5)
+            # Bunny DNS-01: either one exact hostname or base + wildcard.
+            ensure_bunny_plugin || return 1
+            local bunny_credentials="$HOME/.secrets/certbot/bunny.ini"
+            write_bunny_credentials "$bunny_credentials" || return 1
+            local domain_args=(-d "$DOMAIN")
+            case "$bunny_cert_type" in
+                single) ;;
+                wildcard)
+                    # Ask explicitly: taking the last two labels breaks co.uk
+                    # and wildcard certificates for delegated subzones.
+                    local wildcard_base="${5:-}" suggested_base="$DOMAIN"
+                    if [[ "$1" != \*.* && "$DOMAIN" == *.*.* ]]; then
+                        suggested_base="${DOMAIN#*.}"
+                    fi
+                    while [ -z "$wildcard_base" ]; do
+                        reading "$(printf "${LANG[BUNNY_WILDCARD_BASE]}" "$suggested_base")" wildcard_base || return 1
+                        wildcard_base="${wildcard_base:-$suggested_base}"
+                        wildcard_base="${wildcard_base#\*.}"
+                        if ! [[ "$wildcard_base" =~ ^[a-zA-Z0-9.-]+$ ]] ||
+                            ! cert_covers_domain "$DOMAIN" "$wildcard_base"$'\n'"*.$wildcard_base"; then
+                            echo -e "${COLOR_RED}${LANG[CERT_MANUAL_BAD_DOMAIN]}${COLOR_RESET}"
+                            wildcard_base=""
+                        fi
+                    done
+                    [[ "$wildcard_base" =~ ^[a-zA-Z0-9.-]+$ ]] &&
+                        cert_covers_domain "$DOMAIN" "$wildcard_base"$'\n'"*.$wildcard_base" || return 1
+                    expected_lineage="$wildcard_base"
+                    domain_args=(-d "$wildcard_base" -d "*.$wildcard_base")
+                    ;;
+                *) return 1 ;;
+            esac
+
+            certbot certonly \
+                --authenticator dns-bunny \
+                --dns-bunny-credentials "$bunny_credentials" \
+                --dns-bunny-propagation-seconds 120 \
+                --cert-name "$expected_lineage" \
+                "${domain_args[@]}" \
+                "${email_args[@]}" \
+                --agree-tos \
+                --non-interactive \
+                --key-type ecdsa \
+                --elliptic-curve secp384r1 || return 1
             ;;
         *)
             echo -e "${COLOR_RED}${LANG[INVALID_CERT_METHOD]}${COLOR_RESET}"
@@ -234,14 +311,7 @@ EOL
             ;;
     esac
 
-    # Wildcard lineages (DNS-01 methods) are named after the base domain,
-    # not after the subdomain the caller asked for
-    local expected_lineage="$DOMAIN"
-    if [ "$CERT_METHOD" = "1" ] || [ "$CERT_METHOD" = "3" ]; then
-        expected_lineage="$BASE_DOMAIN"
-    fi
-
-    if [ ! -d "/etc/letsencrypt/live/$expected_lineage" ]; then
+    if ! resolve_certificate_domain "$DOMAIN" >/dev/null; then
         echo -e "${COLOR_RED}${LANG[CERT_GENERATION_FAILED]} $expected_lineage${COLOR_RESET}"
         return 1
     fi
@@ -339,6 +409,8 @@ update_current_certificates() {
                 cert_method="1" # Cloudflare DNS-01
             elif grep -q "dns-gcore" "$renewal_conf"; then
                 cert_method="3" # Gcore DNS-01
+            elif grep -Eq "dns[-_]bunny" "$renewal_conf"; then
+                cert_method="5" # Bunny DNS-01
             fi
         else
             # No renewal conf = a manually uploaded certificate: certbot
@@ -357,7 +429,7 @@ update_current_certificates() {
         local cert_mtime_before
         cert_mtime_before=$(stat -c %Y "$cert_file" 2>/dev/null || echo 0)
 
-        fix_letsencrypt_structure "$cert_domain"
+        fix_letsencrypt_structure "$domain"
 
         local days_left
         days_left=$(check_cert_expiry "$domain")
@@ -397,6 +469,13 @@ EOL
                 fi
                 chmod 600 "$cf_credentials_file"
             fi
+        elif [ "$cert_method" == "5" ]; then
+            ensure_bunny_plugin || return 1
+            local bunny_credentials_file
+            bunny_credentials_file=$(sed -nE 's/^[[:space:]]*dns[-_]bunny[-_]credentials[[:space:]]*=[[:space:]]*(.*)/\1/p' "$renewal_conf")
+            if [ -n "$bunny_credentials_file" ] && [ ! -s "$bunny_credentials_file" ]; then
+                write_bunny_credentials "$bunny_credentials_file" || return 1
+            fi
         elif [ "$cert_method" == "3" ]; then
             # Gcore
             local gcore_credentials_file
@@ -416,19 +495,11 @@ EOL
         fi
 
         if [ "$days_left" -le "$renew_threshold" ]; then
-            if [ "$cert_method" == "2" ]; then
-                ufw allow 80/tcp > /dev/null 2>&1 && ufw reload > /dev/null 2>&1
-            fi
-
             certbot renew --cert-name "$domain" --no-random-sleep-on-renew >> /var/log/letsencrypt/letsencrypt.log 2>&1 &
             local cert_pid=$!
             spinner $cert_pid "${LANG[WAITING]}"
             wait $cert_pid
             local certbot_exit_code=$?
-
-            if [ "$cert_method" == "2" ]; then
-                ufw delete allow 80/tcp > /dev/null 2>&1 && ufw reload > /dev/null 2>&1
-            fi
 
             if [ "$certbot_exit_code" -ne 0 ]; then
                 cert_status["$cert_domain"]="${LANG[ERROR_UPDATE]}: ${LANG[CERTBOT_RENEWAL_FAILED]}"
@@ -442,7 +513,7 @@ EOL
             local cert_mtime_after
             cert_mtime_after=$(stat -c %Y "$new_cert_dir/fullchain.pem" 2>/dev/null || echo 0)
 
-            if check_certificates "$new_domain" > /dev/null 2>&1 && [ "$cert_mtime_before" != "$cert_mtime_after" ]; then
+            if check_certificates "$cert_domain" > /dev/null 2>&1 && [ "$cert_mtime_before" != "$cert_mtime_after" ]; then
                 local new_days_left
                 new_days_left=$(check_cert_expiry "$new_domain")
                 if [ $? -eq 0 ]; then
@@ -485,6 +556,7 @@ generate_new_certificates() {
     echo -e "${COLOR_YELLOW}2. ${LANG[CERT_METHOD_ACME]}${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}3. ${LANG[CERT_METHOD_GCORE]}${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}4. ${LANG[CERT_MANUAL]}${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}5. ${LANG[CERT_METHOD_BUNNY]}${COLOR_RESET}"
     echo -e ""
     echo -e "${COLOR_YELLOW}0. ${LANG[EXIT]}${COLOR_RESET}"
     echo -e ""
@@ -496,7 +568,7 @@ generate_new_certificates() {
                 echo -e "${COLOR_YELLOW}${LANG[EXIT]}${COLOR_RESET}"
                 return 0
                 ;;
-            1|2|3|4)
+            1|2|3|4|5)
                 break
                 ;;
             *)
@@ -506,7 +578,11 @@ generate_new_certificates() {
     done
 
     local LETSENCRYPT_EMAIL=""
-    if [ "$CERT_METHOD" == "2" ] || [ "$CERT_METHOD" == "3" ]; then
+    local BUNNY_CERT_TYPE=single
+    if [ "$CERT_METHOD" = "5" ]; then
+        choose_bunny_certificate_type || return 1
+    fi
+    if [ "$CERT_METHOD" == "2" ] || [ "$CERT_METHOD" == "3" ] || [ "$CERT_METHOD" == "5" ]; then
         reading "${LANG[EMAIL_PROMPT]}" LETSENCRYPT_EMAIL
     fi
 
@@ -514,14 +590,16 @@ generate_new_certificates() {
         # 4 = own certificate: upload and verify, no certbot involved
         manual_certificate_flow "$NEW_DOMAIN" || return 1
         setup_cert_telegram_notifications
+    elif [ "$CERT_METHOD" == "5" ]; then
+        get_certificates "$NEW_DOMAIN" "5" "$LETSENCRYPT_EMAIL" "$BUNNY_CERT_TYPE" || return 1
     elif [ "$CERT_METHOD" == "1" ] || [ "$CERT_METHOD" == "3" ]; then
         # 1 = CF DNS-01, 3 = Gcore DNS-01 — wildcard
         echo -e "${COLOR_YELLOW}${LANG[GENERATING_WILDCARD_CERT]} *.$NEW_DOMAIN...${COLOR_RESET}"
-        get_certificates "$NEW_DOMAIN" "$CERT_METHOD" "$LETSENCRYPT_EMAIL"
+        get_certificates "$NEW_DOMAIN" "$CERT_METHOD" "$LETSENCRYPT_EMAIL" || return 1
     elif [ "$CERT_METHOD" == "2" ]; then
         # 2 = ACME HTTP-01
         echo -e "${COLOR_YELLOW}${LANG[GENERATING_CERTS]} $NEW_DOMAIN...${COLOR_RESET}"
-        get_certificates "$NEW_DOMAIN" "2" "$LETSENCRYPT_EMAIL"
+        get_certificates "$NEW_DOMAIN" "2" "$LETSENCRYPT_EMAIL" || return 1
     else
         echo -e "${COLOR_RED}${LANG[CERT_INVALID_CHOICE]}${COLOR_RESET}"
         return 1
@@ -530,10 +608,8 @@ generate_new_certificates() {
     if check_certificates "$NEW_DOMAIN"; then
         # Wire the renewal hooks right away: without the pre/post hooks a
         # standalone cert cannot renew unattended while nginx holds port 80
-        local lineage_domain="$NEW_DOMAIN"
-        if [ "$CERT_METHOD" = "1" ] || [ "$CERT_METHOD" = "3" ]; then
-            lineage_domain=$(extract_domain "$NEW_DOMAIN")
-        fi
+        local lineage_domain
+        lineage_domain=$(resolve_certificate_domain "$NEW_DOMAIN") || return 1
         local renewal_conf="/etc/letsencrypt/renewal/$lineage_domain.conf"
         [ -f "$renewal_conf" ] && configure_certbot_renewal_hooks "$renewal_conf"
         echo -e "${COLOR_GREEN}${LANG[CERT_UPDATE_SUCCESS]}${COLOR_RESET}"
@@ -548,10 +624,13 @@ generate_new_certificates() {
 check_cert_expiry() {
     local domain="$1"
     local cert_dir="/etc/letsencrypt/live"
-    local live_dir=$(find "$cert_dir" -maxdepth 1 -type d -name "${domain}*" | sort -V | tail -n 1)
-    if [ -z "$live_dir" ] || [ ! -d "$live_dir" ]; then
-        return 1
+    local lineage live_dir
+    if [ -s "$cert_dir/$domain/fullchain.pem" ]; then
+        lineage="$domain"
+    else
+        lineage=$(resolve_certificate_domain "$domain") || return 1
     fi
+    live_dir="$cert_dir/$lineage"
     local cert_file="$live_dir/fullchain.pem"
     if [ ! -f "$cert_file" ]; then
         return 1
@@ -572,6 +651,49 @@ check_cert_expiry() {
     return 0
 }
 
+install_certbot_hook_script() {
+    mkdir -p "$DIR_REMNAWAVE" || return 1
+    cat > "${DIR_REMNAWAVE}certbot-hooks.sh" <<'HOOK'
+#!/bin/bash
+# Certbot replaces the targets of live/ symlinks. Restart file-bind consumers
+# after renewal so both the reverse proxy and remnanode see the new files.
+state_dir=/run/remnawave-certbot
+web_names='^/(remnawave-nginx|remnawave-caddy|caddy-remnawave)$'
+case "$1" in
+    pre)
+        mkdir -p "$state_dir" || exit 1
+        # Certbot may call several lineage pre-hooks in the same renewal run.
+        if [ ! -f "$state_dir/containers" ]; then
+            /usr/bin/docker ps --filter "name=$web_names" --format '{{.Names}}' > "$state_dir/containers" || exit 1
+            xargs -r /usr/bin/docker stop < "$state_dir/containers" || exit 1
+        fi
+        if command -v ufw >/dev/null && ufw status | grep -q '^Status: active' &&
+            ! ufw status | grep -Eq '^80/tcp[[:space:]]+ALLOW([[:space:]]+IN)?[[:space:]]+Anywhere'; then
+            ufw allow 80/tcp comment 'HTTP for ACME challenge' >/dev/null 2>&1 && touch "$state_dir/firewall-added"
+        fi
+        ;;
+    post)
+        if [ -f "$state_dir/containers" ]; then
+            xargs -r /usr/bin/docker start < "$state_dir/containers" || exit 1
+            rm -f "$state_dir/containers"
+        fi
+        if [ -f "$state_dir/firewall-added" ]; then
+            ufw delete allow 80/tcp >/dev/null 2>&1
+            ufw reload >/dev/null 2>&1
+            rm -f "$state_dir/firewall-added"
+        fi
+        ;;
+    deploy)
+        /usr/bin/docker ps --filter 'name=^/(remnawave-nginx|remnawave-caddy|caddy-remnawave|remnanode)$' --format '{{.Names}}' \
+            | xargs -r /usr/bin/docker restart
+        ;;
+    *) exit 1 ;;
+esac
+exit 0
+HOOK
+    chmod 700 "${DIR_REMNAWAVE}certbot-hooks.sh"
+}
+
 configure_certbot_renewal_hooks() {
     local renewal_conf="$1"
 
@@ -580,13 +702,13 @@ configure_certbot_renewal_hooks() {
     fi
 
     sed -i -E '/^(pre_hook|post_hook|renew_hook|deploy_hook) = /d' "$renewal_conf"
+    install_certbot_hook_script || return 1
 
     if grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone[[:space:]]*$' "$renewal_conf"; then
-        echo "pre_hook = /usr/bin/docker stop remnawave-nginx" >> "$renewal_conf"
-        echo "post_hook = /usr/bin/docker start remnawave-nginx" >> "$renewal_conf"
-    else
-        echo "deploy_hook = /usr/bin/docker restart remnawave-nginx" >> "$renewal_conf"
+        echo "pre_hook = ${DIR_REMNAWAVE}certbot-hooks.sh pre" >> "$renewal_conf"
+        echo "post_hook = ${DIR_REMNAWAVE}certbot-hooks.sh post" >> "$renewal_conf"
     fi
+    echo "deploy_hook = ${DIR_REMNAWAVE}certbot-hooks.sh deploy" >> "$renewal_conf"
 }
 
 fix_letsencrypt_structure() {
@@ -664,8 +786,10 @@ handle_certificates() {
     local cert_method="$2"
     local letsencrypt_email="$3"
     local target_dir="${4:-/opt/remnawave}"
+    local mount_nginx="${5:-true}"
+    local BUNNY_CERT_TYPE=single
+    local domain days_left
 
-    declare -A unique_domains
     local need_certificates=false
     local min_days_left=9999
 
@@ -696,6 +820,7 @@ handle_certificates() {
         echo -e "${COLOR_YELLOW}2. ${LANG[CERT_METHOD_ACME]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}3. ${LANG[CERT_METHOD_GCORE]}${COLOR_RESET}"
         echo -e "${COLOR_YELLOW}4. ${LANG[CERT_MANUAL]}${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}5. ${LANG[CERT_METHOD_BUNNY]}${COLOR_RESET}"
         echo -e ""
         echo -e "${COLOR_YELLOW}0. ${LANG[EXIT]}${COLOR_RESET}"
         echo -e ""
@@ -704,7 +829,9 @@ handle_certificates() {
         # at that provider, so its method is the sensible default: prefill
         # it (Enter accepts, the choice stays editable for ACME fans).
         local cert_default=""
-        if [ -n "$GCORE_API_KEY" ]; then
+        if [ -n "$BUNNY_API_KEY" ]; then
+            cert_default="5"
+        elif [ -n "$GCORE_API_KEY" ]; then
             cert_default="3"
         elif [ -n "$CLOUDFLARE_API_KEY" ]; then
             cert_default="1"
@@ -729,7 +856,7 @@ handle_certificates() {
                 1|4)
                     break
                     ;;
-                2|3)
+                2|3|5)
                     reading "${LANG[EMAIL_PROMPT]}" letsencrypt_email
                     break
                     ;;
@@ -738,25 +865,11 @@ handle_certificates() {
                     ;;
             esac
         done
+        if [ "$cert_method" = "5" ]; then
+            choose_bunny_certificate_type || return 1
+        fi
     else
         echo -e "${COLOR_GREEN}${LANG[CERTS_SKIPPED]}${COLOR_RESET}"
-        cert_method="1"
-        for domain in "${!domains_to_check_ref[@]}"; do
-            local existing_conf="/etc/letsencrypt/renewal/$domain.conf"
-            local base_domain
-            base_domain=$(extract_domain "$domain")
-            if [ -f "/etc/letsencrypt/renewal/$base_domain.conf" ] && is_wildcard_cert "$base_domain"; then
-                existing_conf="/etc/letsencrypt/renewal/$base_domain.conf"
-            fi
-
-            if grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone[[:space:]]*$' "$existing_conf" 2>/dev/null; then
-                # Opening port 80 is required if any managed certificate uses HTTP-01.
-                cert_method="2"
-                break
-            elif grep -q "dns-gcore" "$existing_conf" 2>/dev/null; then
-                cert_method="3"
-            fi
-        done
     fi
 
     declare -A cert_domains_added
@@ -775,109 +888,43 @@ handle_certificates() {
         setup_cert_telegram_notifications
     fi
 
-    if [ "$need_certificates" = true ] && [ "$cert_method" == "1" ]; then
+    if [ "$need_certificates" = true ] && [ "$cert_method" != "4" ]; then
         for domain in "${!domains_to_check_ref[@]}"; do
-            local base_domain
-            base_domain=$(extract_domain "$domain")
-            unique_domains["$base_domain"]="1"
-        done
-
-        for domain in "${!unique_domains[@]}"; do
-            get_certificates "$domain" "1" ""
-            if [ $? -ne 0 ]; then
-                echo -e "${COLOR_RED}${LANG[CERT_GENERATION_FAILED]} $domain${COLOR_RESET}"
-                return 1
-            fi
+            # Reuse existing certificates and issue each wildcard only once.
+            check_certificates "$domain" >/dev/null 2>&1 && continue
+            get_certificates "$domain" "$cert_method" "$letsencrypt_email" "$BUNNY_CERT_TYPE" || return 1
             min_days_left=90
-            if [ -z "${cert_domains_added[$domain]}" ]; then
-                echo "      - /etc/letsencrypt/live/$domain/fullchain.pem:/etc/nginx/ssl/$domain/fullchain.pem:ro" >> "$target_dir/docker-compose.yml"
-                echo "      - /etc/letsencrypt/live/$domain/privkey.pem:/etc/nginx/ssl/$domain/privkey.pem:ro" >> "$target_dir/docker-compose.yml"
-                cert_domains_added["$domain"]="1"
-            fi
-        done
-
-    elif [ "$need_certificates" = true ] && [ "$cert_method" == "3" ]; then
-        for domain in "${!domains_to_check_ref[@]}"; do
-            local base_domain
-            base_domain=$(extract_domain "$domain")
-            unique_domains["$base_domain"]="1"
-        done
-
-        for domain in "${!unique_domains[@]}"; do
-            get_certificates "$domain" "3" "$letsencrypt_email"
-            if [ $? -ne 0 ]; then
-                echo -e "${COLOR_RED}${LANG[CERT_GENERATION_FAILED]} $domain${COLOR_RESET}"
-                return 1
-            fi
-            min_days_left=90
-            if [ -z "${cert_domains_added[$domain]}" ]; then
-                echo "      - /etc/letsencrypt/live/$domain/fullchain.pem:/etc/nginx/ssl/$domain/fullchain.pem:ro" >> "$target_dir/docker-compose.yml"
-                echo "      - /etc/letsencrypt/live/$domain/privkey.pem:/etc/nginx/ssl/$domain/privkey.pem:ro" >> "$target_dir/docker-compose.yml"
-                cert_domains_added["$domain"]="1"
-            fi
-        done
-
-    elif [ "$need_certificates" = true ] && [ "$cert_method" == "2" ]; then
-        for domain in "${!domains_to_check_ref[@]}"; do
-            get_certificates "$domain" "2" "$letsencrypt_email"
-            if [ $? -ne 0 ]; then
-                echo -e "${COLOR_RED}${LANG[CERT_GENERATION_FAILED]} $domain${COLOR_RESET}"
-                continue
-            fi
-            if [ -z "${cert_domains_added[$domain]}" ]; then
-                echo "      - /etc/letsencrypt/live/$domain/fullchain.pem:/etc/nginx/ssl/$domain/fullchain.pem:ro" >> "$target_dir/docker-compose.yml"
-                echo "      - /etc/letsencrypt/live/$domain/privkey.pem:/etc/nginx/ssl/$domain/privkey.pem:ro" >> "$target_dir/docker-compose.yml"
-                cert_domains_added["$domain"]="1"
-            fi
-        done
-    else
-        for domain in "${!domains_to_check_ref[@]}"; do
-            local base_domain
-            base_domain=$(extract_domain "$domain")
-            local cert_domain="$domain"
-            if [ -d "/etc/letsencrypt/live/$base_domain" ] && is_wildcard_cert "$base_domain"; then
-                cert_domain="$base_domain"
-            fi
-            if [ -z "${cert_domains_added[$cert_domain]}" ]; then
-                echo "      - /etc/letsencrypt/live/$cert_domain/fullchain.pem:/etc/nginx/ssl/$cert_domain/fullchain.pem:ro" >> "$target_dir/docker-compose.yml"
-                echo "      - /etc/letsencrypt/live/$cert_domain/privkey.pem:/etc/nginx/ssl/$cert_domain/privkey.pem:ro" >> "$target_dir/docker-compose.yml"
-                cert_domains_added["$cert_domain"]="1"
-            fi
         done
     fi
 
-    local cron_command
-    # The deploy hook restarts the web server container only when a cert
-    # was actually renewed: the certs are bind-mounted into the container
-    # by file, so without a restart it keeps serving the old inode until
-    # it eventually expires.
-    local renew_hook="docker restart remnawave-nginx remnawave-caddy 2>/dev/null || true"
-    if [ "$cert_method" == "2" ]; then
-        cron_command="ufw allow 80/tcp >/dev/null 2>&1 && /usr/bin/certbot renew --quiet --deploy-hook \"$renew_hook\"; certbot_status=\$?; ufw delete allow 80/tcp >/dev/null 2>&1; ufw reload >/dev/null 2>&1; exit \$certbot_status"
-    else
-        cron_command="/usr/bin/certbot renew --quiet --deploy-hook \"$renew_hook\""
-    fi
+    for domain in "${!domains_to_check_ref[@]}"; do
+        local cert_domain
+        cert_domain=$(resolve_certificate_domain "$domain") || return 1
+        if [ "$mount_nginx" = true ] && [ -z "${cert_domains_added[$cert_domain]}" ]; then
+            echo "      - /etc/letsencrypt/live/$cert_domain/fullchain.pem:/etc/nginx/ssl/$cert_domain/fullchain.pem:ro" >> "$target_dir/docker-compose.yml"
+            echo "      - /etc/letsencrypt/live/$cert_domain/privkey.pem:/etc/nginx/ssl/$cert_domain/privkey.pem:ro" >> "$target_dir/docker-compose.yml"
+            cert_domains_added["$cert_domain"]=1
+        fi
+    done
+
+    local cron_command="/usr/bin/certbot renew --quiet"
 
     if ! crontab -u root -l 2>/dev/null | grep -q "/usr/bin/certbot renew"; then
         echo -e "${COLOR_YELLOW}${LANG[ADDING_CRON_FOR_EXISTING_CERTS]}${COLOR_RESET}"
         add_cron_rule "0 5 * * 0 $cron_command"
-    elif [ "$min_days_left" -le 30 ] && ! crontab -u root -l 2>/dev/null | grep -q "0 5 * * 0.*$cron_command"; then
-        echo -e "${COLOR_YELLOW}${LANG[CERT_EXPIRY_SOON]} $min_days_left ${LANG[DAYS]}${COLOR_RESET}"
+    elif crontab -u root -l 2>/dev/null | grep -Eq '^0 5 \* \* 0 .*certbot renew.*--deploy-hook'; then
+        # Migrate the previous installer-owned cron rule. Its CLI hook
+        # overrides the lineage hook and never restarts remnanode.
         echo -e "${COLOR_YELLOW}${LANG[UPDATING_CRON]}${COLOR_RESET}"
-        crontab -u root -l 2>/dev/null | grep -v "/usr/bin/certbot renew" | crontab -u root -
+        crontab -u root -l 2>/dev/null | grep -Ev '^0 5 \* \* 0 .*certbot renew.*--deploy-hook' | crontab -u root -
         add_cron_rule "0 5 * * 0 $cron_command"
     else
         echo -e "${COLOR_YELLOW}${LANG[CRON_ALREADY_EXISTS]}${COLOR_RESET}"
     fi
 
     for domain in "${!domains_to_check_ref[@]}"; do
-        local cert_domain="$domain"
-        local base_domain
-        base_domain=$(extract_domain "$domain")
-        if [ -f "/etc/letsencrypt/renewal/$base_domain.conf" ] && is_wildcard_cert "$base_domain"; then
-            cert_domain="$base_domain"
-        fi
-
+        local cert_domain
+        cert_domain=$(resolve_certificate_domain "$domain") || return 1
         local renewal_conf="/etc/letsencrypt/renewal/$cert_domain.conf"
         if [ -f "$renewal_conf" ]; then
             configure_certbot_renewal_hooks "$renewal_conf"
@@ -904,7 +951,10 @@ cert_covers_domain() {
             \*.*)
                 base="${entry#\*.}"
                 case "$domain" in
-                    *."$base") return 0 ;;
+                    *."$base")
+                        local label="${domain%."$base"}"
+                        [[ -n "$label" && "$label" != *.* ]] && return 0
+                        ;;
                 esac
                 ;;
         esac
