@@ -170,14 +170,18 @@ The panel remains invisible without the correct authentication parameter.
 
 ## Quick Start
 
+This fork adds Bunny DNS-01 (single hostname or wildcard) and read-only
+certificate mounts under `/ssl/` in the node container. Cloudflare and Gcore
+remain available. See [setup and verification notes (Russian)](BUNNY-DNS.md).
+
 Execute the following command to begin installation:
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/tzarsolomon-source/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
 ```
 
 If GitHub is unreachable, use the jsDelivr mirror:
 ```bash
-bash <(curl -Ls https://cdn.jsdelivr.net/gh/eGamesAPI/remnawave-reverse-proxy@main/install_remnawave.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/tzarsolomon-source/remnawave-reverse-proxy@main/install_remnawave.sh)
 ```
 
 <p align="center">

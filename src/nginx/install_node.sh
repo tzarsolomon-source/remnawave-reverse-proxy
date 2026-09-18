@@ -87,23 +87,9 @@ installation_node() {
     declare -A domains_to_check
     domains_to_check["$SELFSTEAL_DOMAIN"]=1
 
-    handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnanode"
+    handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnanode" || return 1
 
-    if [ -z "$CERT_METHOD" ]; then
-        local base_domain=$(extract_domain "$SELFSTEAL_DOMAIN")
-        if [ -d "/etc/letsencrypt/live/$base_domain" ] && is_wildcard_cert "$base_domain"; then
-            CERT_METHOD="1"
-        else
-            CERT_METHOD="2"
-        fi
-    fi
-
-    if [ "$CERT_METHOD" == "1" ]; then
-        local base_domain=$(extract_domain "$SELFSTEAL_DOMAIN")
-        NODE_CERT_DOMAIN="$base_domain"
-    else
-        NODE_CERT_DOMAIN="$SELFSTEAL_DOMAIN"
-    fi
+    NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
 
     cat >> /opt/remnanode/docker-compose.yml <<EOL
       - /dev/shm:/dev/shm:rw
@@ -124,6 +110,8 @@ installation_node() {
     volumes:
       - /dev/shm:/dev/shm:rw
       - /var/log/remnanode:/var/log/remnanode
+      - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/fullchain.pem:/ssl/fullchain.pem:ro
+      - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/privkey.pem:/ssl/privkey.pem:ro
 EOL
 
 cat > /opt/remnanode/nginx.conf <<EOL

@@ -174,6 +174,11 @@ POSTGRES_PASSWORD=postgres
 POSTGRES_DB=postgres
 EOL
 
+    load_certificates_module
+    local -A node_domains_to_check=(["$SELFSTEAL_DOMAIN"]=1)
+    handle_certificates node_domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnawave" false || return 1
+    NODE_CERT_DOMAIN=$(resolve_certificate_domain "$SELFSTEAL_DOMAIN") || return 1
+
     cat > docker-compose.yml <<EOL
 x-common: &common
   ulimits:
@@ -273,6 +278,8 @@ services:
           - /var/www/html:/var/www/html:ro
           - /dev/shm:/dev/shm:rw
           - caddy_data:/data
+          - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/fullchain.pem:/ssl/fullchain.pem:ro
+          - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/privkey.pem:/ssl/privkey.pem:ro
       command: sh -c 'rm -f /dev/shm/nginx.sock && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
       environment:
           - CADDY_SOCKET_PATH=/dev/shm/nginx.sock
@@ -320,6 +327,8 @@ services:
     volumes:
       - /dev/shm:/dev/shm:rw
       - /var/log/remnanode:/var/log/remnanode
+      - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/fullchain.pem:/ssl/fullchain.pem:ro
+      - /etc/letsencrypt/live/$NODE_CERT_DOMAIN/privkey.pem:/ssl/privkey.pem:ro
 
 networks:
   remnawave-network:
@@ -412,6 +421,7 @@ http://{\$SELF_STEAL_DOMAIN} {
 }
 
 https://{\$SELF_STEAL_DOMAIN} {
+    tls /ssl/fullchain.pem /ssl/privkey.pem
     bind unix/{\$CADDY_SOCKET_PATH}
     root * /var/www/html
     try_files {path} /index.html
@@ -442,6 +452,7 @@ http://{\$SELF_STEAL_DOMAIN} {
 }
 
 https://{\$SELF_STEAL_DOMAIN} {
+    tls /ssl/fullchain.pem /ssl/privkey.pem
     bind unix/{\$CADDY_SOCKET_PATH}
     root * /var/www/html
     try_files {path} /index.html
@@ -580,7 +591,7 @@ installation_panel_node_caddy() {
     check_panel_not_running
     check_port_443_free
     check_node_not_running
-    install_panel_node_caddy
+    install_panel_node_caddy || return 1
 	
     echo -e "${COLOR_YELLOW}${LANG[STARTING_PANEL_NODE]}${COLOR_RESET}"
     sleep 1

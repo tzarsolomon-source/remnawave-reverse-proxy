@@ -170,14 +170,18 @@ https://panel.example.com/auth/login?<SECRET_KEY>=<SECRET_KEY>
 
 ## Быстрый старт
 
+В этом форке добавлены Bunny DNS-01 (отдельный домен или wildcard) и
+монтирование сертификата в `/ssl/` контейнера ноды. Cloudflare и Gcore
+сохранены. [Инструкция и проверка изменений](BUNNY-DNS.md).
+
 Выполните следующую команду для начала установки:
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/tzarsolomon-source/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
 ```
 
 Если GitHub недоступен, используйте зеркало на jsDelivr:
 ```bash
-bash <(curl -Ls https://cdn.jsdelivr.net/gh/eGamesAPI/remnawave-reverse-proxy@main/install_remnawave.sh)
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/tzarsolomon-source/remnawave-reverse-proxy@main/install_remnawave.sh)
 ```
 
 <p align="center">
